@@ -19,7 +19,7 @@ CudaOrganizedPointcloudAdapterNode::CudaOrganizedPointcloudAdapterNode(
       *this, "~/output/pointcloud");
   
   pointcloud_sub_ = this->create_subscription<sensor_msgs::msg::PointCloud2>(
-    "~/input/pointcloud", 10,
+    "~/input/pointcloud", rclcpp::SensorDataQoS{}.keep_last(1),
     std::bind(&CudaOrganizedPointcloudAdapterNode::pointcloudCallback, this, std::placeholders::_1));
 
   next_ring_index_.fill(0);
@@ -35,7 +35,6 @@ void CudaOrganizedPointcloudAdapterNode::pointcloudCallback(
   assert(input_pointcloud_msg_ptr->point_step == sizeof(autoware_point_types::PointXYZIRCAEDT));
   const autoware_point_types::PointXYZIRCAEDT * input_buffer = reinterpret_cast<const autoware_point_types::PointXYZIRCAEDT*>(input_pointcloud_msg_ptr->data.data());
 
-
   for (std::size_t i = 0; i < input_pointcloud_msg_ptr->width * input_pointcloud_msg_ptr->height; i++)
   {
     const autoware_point_types::PointXYZIRCAEDT & point = input_buffer[i];
@@ -48,7 +47,7 @@ void CudaOrganizedPointcloudAdapterNode::pointcloudCallback(
   // Copy to cuda memory
   cudaMemcpy(device_buffer_, buffer_.data(), MAX_RINGS * MAX_POINTS_PER_RING * sizeof(autoware_point_types::PointXYZIRCAEDT), cudaMemcpyHostToDevice);
 
-  std::unique_ptr<cuda_blackboard::CudaPointCloud2> cuda_pointcloud_msg_ptr;
+  auto cuda_pointcloud_msg_ptr = std::make_unique<cuda_blackboard::CudaPointCloud2>();
   cuda_pointcloud_msg_ptr->width = MAX_POINTS_PER_RING;
   cuda_pointcloud_msg_ptr->height = MAX_RINGS;
   cuda_pointcloud_msg_ptr->point_step = sizeof(autoware_point_types::PointXYZIRCAEDT);
