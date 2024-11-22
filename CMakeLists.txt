@@ -42,7 +42,7 @@ target_link_libraries(cuda_organized_pointcloud_adapter
 )
 
 rclcpp_components_register_node(cuda_organized_pointcloud_adapter
-  PLUGIN "cuda_organized_pointcloud_adapter::CudaOrganizedPointcloudAdapterNode"
+  PLUGIN "autoware::cuda_organized_pointcloud_adapter::CudaOrganizedPointcloudAdapterNode"
   EXECUTABLE cuda_organized_pointcloud_adapter_node
 )
 

@@ -1,11 +1,24 @@
+// Copyright 2024 TIER IV, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
-#include "cuda_organized_pointcloud_adapter/cuda_organized_pointcloud_adapter_node.hpp"
+#include "autoware/cuda_organized_pointcloud_adapter/cuda_organized_pointcloud_adapter_node.hpp"
 
 #include <cuda_runtime.h>
 
 #include <vector>
 
-namespace cuda_organized_pointcloud_adapter
+namespace autoware::cuda_organized_pointcloud_adapter
 {
 using sensor_msgs::msg::PointCloud2;
 
@@ -25,13 +38,6 @@ CudaOrganizedPointcloudAdapterNode::CudaOrganizedPointcloudAdapterNode(
     std::bind(&CudaOrganizedPointcloudAdapterNode::pointcloudCallback, this, std::placeholders::_1),
     sub_options);
 
-  next_ring_index_.fill(0);
-  buffer_.resize(MAX_RINGS * MAX_POINTS_PER_RING);
-
-  cudaMalloc(
-    &device_buffer_,
-    MAX_RINGS * MAX_POINTS_PER_RING * sizeof(autoware_point_types::PointXYZIRCAEDT));
-
   // initialize debug tool
   {
     using autoware::universe_utils::DebugPublisher;
@@ -43,38 +49,120 @@ CudaOrganizedPointcloudAdapterNode::CudaOrganizedPointcloudAdapterNode(
   }
 }
 
+void CudaOrganizedPointcloudAdapterNode::estimatePointcloudRingInfo(
+  const sensor_msgs::msg::PointCloud2::ConstSharedPtr input_pointcloud_msg_ptr)
+{
+  const autoware::point_types::PointXYZIRCAEDT * input_buffer =
+    reinterpret_cast<const autoware::point_types::PointXYZIRCAEDT *>(
+      input_pointcloud_msg_ptr->data.data());
+
+  std::size_t max_ring = 0;
+
+  for (std::size_t i = 0; i < input_pointcloud_msg_ptr->width * input_pointcloud_msg_ptr->height;
+       i++) {
+    const autoware::point_types::PointXYZIRCAEDT & point = input_buffer[i];
+    const std::size_t ring = static_cast<std::size_t>(point.channel);
+    max_ring = std::max(max_ring, ring);
+  }
+
+  // Set max rings to the next power of two
+  num_rings_ = std::pow(2, std::ceil(std::log2(max_ring + 1)));
+  num_rings_ = std::max(num_rings_, static_cast<std::size_t>(16));
+  std::vector<std::size_t> ring_points(num_rings_, 0);
+
+  for (std::size_t i = 0; i < input_pointcloud_msg_ptr->width * input_pointcloud_msg_ptr->height;
+       i++) {
+    const autoware::point_types::PointXYZIRCAEDT & point = input_buffer[i];
+    const std::size_t ring = point.channel;
+    ring_points[ring]++;
+  }
+
+  // Set max points per ring to the next multiple of 512
+  max_points_per_ring_ = *std::max_element(ring_points.begin(), ring_points.end());
+  max_points_per_ring_ = std::max(max_points_per_ring_, static_cast<std::size_t>(512));
+  max_points_per_ring_ = (max_points_per_ring_ + 511) / 512 * 512;
+
+  next_ring_index_.resize(num_rings_);
+  std::fill(next_ring_index_.begin(), next_ring_index_.end(), 0);
+  buffer_.resize(num_rings_ * max_points_per_ring_);
+
+  /* if (device_buffer_ != nullptr) {
+    cudaFree(device_buffer_);
+  } */
+
+  device_buffer_ = cuda_blackboard::make_unique<std::uint8_t[]>(
+    num_rings_ * max_points_per_ring_ * sizeof(autoware::point_types::PointXYZIRCAEDT));
+
+  /* cudaMalloc(
+    device_buffer_,
+    num_rings_ * max_points_per_ring_ * sizeof(autoware::point_types::PointXYZIRCAEDT)); */
+  
+  RCLCPP_INFO_STREAM(
+    get_logger(), "Estimated rings: " << num_rings_ << ", max_points_per_ring: "
+                                           << max_points_per_ring_ << ". This should only be done during the first iterations. Otherwise, performance will be affected.");
+}
+
+
+bool CudaOrganizedPointcloudAdapterNode::orderPointcloud(
+  const sensor_msgs::msg::PointCloud2::ConstSharedPtr input_pointcloud_msg_ptr)
+{
+  const autoware::point_types::PointXYZIRCAEDT * input_buffer =
+    reinterpret_cast<const autoware::point_types::PointXYZIRCAEDT *>(
+      input_pointcloud_msg_ptr->data.data());
+
+  bool ring_overflow = false;
+  bool point_overflow = false;
+
+  for (std::size_t i = 0; i < input_pointcloud_msg_ptr->width * input_pointcloud_msg_ptr->height;
+       i++) {
+    const autoware::point_types::PointXYZIRCAEDT & point = input_buffer[i];
+    const std::size_t raw_ring = point.channel;
+    const std::size_t ring = raw_ring % num_rings_;
+
+    const std::size_t raw_index = next_ring_index_[ring];
+    const std::size_t index = raw_index % max_points_per_ring_;
+    
+    ring_overflow |= raw_ring >= num_rings_;
+    point_overflow |= raw_index >= max_points_per_ring_;
+    
+    buffer_[ring * max_points_per_ring_ + index] = point;
+    next_ring_index_[ring] = (index + 1) % max_points_per_ring_;
+  }
+
+  return !ring_overflow && !point_overflow;
+}
+
 void CudaOrganizedPointcloudAdapterNode::pointcloudCallback(
   const sensor_msgs::msg::PointCloud2::ConstSharedPtr input_pointcloud_msg_ptr)
 {
   stop_watch_ptr_->toc("processing_time", true);
 
-  assert(input_pointcloud_msg_ptr->point_step == sizeof(autoware_point_types::PointXYZIRCAEDT));
-  const autoware_point_types::PointXYZIRCAEDT * input_buffer =
-    reinterpret_cast<const autoware_point_types::PointXYZIRCAEDT *>(
-      input_pointcloud_msg_ptr->data.data());
+  // TODO(knzo25): check the pointcloud layout at least once
 
-  for (std::size_t i = 0; i < input_pointcloud_msg_ptr->width * input_pointcloud_msg_ptr->height;
-       i++) {
-    const autoware_point_types::PointXYZIRCAEDT & point = input_buffer[i];
-    const std::size_t ring = point.channel;
-    const std::size_t index = next_ring_index_[ring];
-    buffer_[ring * MAX_POINTS_PER_RING + index] = point;
-    next_ring_index_[ring] = (index + 1) % MAX_POINTS_PER_RING;
+  assert(input_pointcloud_msg_ptr->point_step == sizeof(autoware::point_types::PointXYZIRCAEDT));
+  
+  if (num_rings_ == 0 || max_points_per_ring_ == 0) {
+    estimatePointcloudRingInfo(input_pointcloud_msg_ptr);
   }
 
+  if (!orderPointcloud(input_pointcloud_msg_ptr)) {
+    estimatePointcloudRingInfo(input_pointcloud_msg_ptr);
+    orderPointcloud(input_pointcloud_msg_ptr);
+  }
+  
   // Copy to cuda memory
   cudaMemcpy(
-    device_buffer_, buffer_.data(),
-    MAX_RINGS * MAX_POINTS_PER_RING * sizeof(autoware_point_types::PointXYZIRCAEDT),
+    device_buffer_.get(), buffer_.data(),
+    num_rings_ * max_points_per_ring_ * sizeof(autoware::point_types::PointXYZIRCAEDT),
     cudaMemcpyHostToDevice);
 
   auto cuda_pointcloud_msg_ptr = std::make_unique<cuda_blackboard::CudaPointCloud2>();
-  cuda_pointcloud_msg_ptr->width = MAX_POINTS_PER_RING;
-  cuda_pointcloud_msg_ptr->height = MAX_RINGS;
-  cuda_pointcloud_msg_ptr->point_step = sizeof(autoware_point_types::PointXYZIRCAEDT);
+  cuda_pointcloud_msg_ptr->width = max_points_per_ring_;
+  cuda_pointcloud_msg_ptr->height = num_rings_;
+  cuda_pointcloud_msg_ptr->point_step = sizeof(autoware::point_types::PointXYZIRCAEDT);
   cuda_pointcloud_msg_ptr->row_step =
-    MAX_POINTS_PER_RING * sizeof(autoware_point_types::PointXYZIRCAEDT);
-  cuda_pointcloud_msg_ptr->data = reinterpret_cast<uint8_t *>(device_buffer_);
+    max_points_per_ring_ * sizeof(autoware::point_types::PointXYZIRCAEDT);
+  cuda_pointcloud_msg_ptr->data = std::move(device_buffer_);/*reinterpret_cast<uint8_t *>(device_buffer_)*/;
   cuda_pointcloud_msg_ptr->is_dense = input_pointcloud_msg_ptr->is_dense;
   cuda_pointcloud_msg_ptr->header = input_pointcloud_msg_ptr->header;
 
@@ -93,18 +181,20 @@ void CudaOrganizedPointcloudAdapterNode::pointcloudCallback(
   }
 
   // Allocate cuda memory
-  cudaMalloc(
+  device_buffer_ = cuda_blackboard::make_unique<std::uint8_t[]>(
+    num_rings_ * max_points_per_ring_ * sizeof(autoware::point_types::PointXYZIRCAEDT));
+  /* cudaMalloc(
     &device_buffer_,
-    MAX_RINGS * MAX_POINTS_PER_RING * sizeof(autoware_point_types::PointXYZIRCAEDT));
+    num_rings_ * max_points_per_ring_ * sizeof(autoware::point_types::PointXYZIRCAEDT)); */
   // Clear indexes
-  next_ring_index_.fill(0);
+  std::fill(next_ring_index_.begin(), next_ring_index_.end(), 0);
 
   // Clear pointcloud buffer
-  std::fill(buffer_.begin(), buffer_.end(), autoware_point_types::PointXYZIRCAEDT{});
+  std::fill(buffer_.begin(), buffer_.end(), autoware::point_types::PointXYZIRCAEDT{});
 }
 
 }  // namespace cuda_organized_pointcloud_adapter
 
 #include "rclcpp_components/register_node_macro.hpp"
 RCLCPP_COMPONENTS_REGISTER_NODE(
-  cuda_organized_pointcloud_adapter::CudaOrganizedPointcloudAdapterNode)
+  autoware::cuda_organized_pointcloud_adapter::CudaOrganizedPointcloudAdapterNode)
